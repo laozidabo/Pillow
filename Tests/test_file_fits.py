@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import struct
 from io import BytesIO
 
@@ -33,15 +34,10 @@ def test_gzip1() -> None:
 def test_gzip_16bit_consecutive_samples() -> None:
     # The decompressed payload of a GZIP_1 image may hold consecutive 2-byte
     # samples rather than the widened 4-byte groups of Tests/images/m13_gzip.fits
-    with Image.open("Tests/images/gzip_1_16bit.fits") as im:
+    values = [-32768, -1, 0, 1, 32767]
+    with Image.open(BytesIO(fits_gzip_image(16, values, False))) as im:
         assert im.mode == "I"
-        assert [im.getpixel((x, 0)) for x in range(im.width)] == [
-            -32768,
-            -1,
-            0,
-            1,
-            32767,
-        ]
+        assert [im.getpixel((x, 0)) for x in range(im.width)] == values
 
 
 def test_gzip_decode() -> None:
@@ -127,6 +123,72 @@ def fits_image(bitpix: int, values: list[int], extra: list[str] = []) -> bytes:
     return header + data + b"\0" * (-len(data) % 2880)
 
 
+def fits_gzip_image(
+    bitpix: int, values: list[int | float], widened: bool
+) -> bytes:
+    data_fmt = {8: "B", 16: "h", 32: "i", -32: "f"}[bitpix]
+    samples = [struct.pack(f">{data_fmt}", value) for value in values]
+    if widened:
+        payload = b"".join(sample.rjust(4, b"\0") for sample in samples)
+    else:
+        payload = b"".join(samples)
+    compressed = gzip.compress(payload, mtime=0)
+
+    primary_cards = [
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "EXTEND  =                    T",
+        "END",
+    ]
+    primary = b"".join(c.ljust(80).encode() for c in primary_cards)
+    primary += b" " * (-len(primary) % 2880)
+
+    extension_cards = [
+        "XTENSION= 'BINTABLE'",
+        "BITPIX  =                    8",
+        "NAXIS   =                    2",
+        "NAXIS1  =                    8",
+        "NAXIS2  =                    1",
+        f"PCOUNT  = {len(compressed):20d}",
+        "GCOUNT  =                    1",
+        "TFIELDS =                    1",
+        "TTYPE1  = 'COMPRESSED_DATA'",
+        f"TFORM1  = '1PB({len(compressed)})'",
+        "ZIMAGE  =                    T",
+        f"ZBITPIX = {bitpix:20d}",
+        "ZNAXIS  =                    2",
+        f"ZNAXIS1 = {len(values):20d}",
+        "ZNAXIS2 =                    1",
+        f"ZTILE1  = {len(values):20d}",
+        "ZTILE2  =                    1",
+        "ZCMPTYPE= 'GZIP_1  '",
+        "END",
+    ]
+    extension = b"".join(c.ljust(80).encode() for c in extension_cards)
+    extension += b" " * (-len(extension) % 2880)
+
+    data = struct.pack(">II", len(compressed), 0) + compressed
+    return primary + extension + data + b"\0" * (-len(data) % 2880)
+
+
+@pytest.mark.parametrize(
+    ("bitpix", "mode", "values", "widened"),
+    [
+        (8, "L", [0, 1, 127, 128, 255], False),
+        (8, "L", [0, 1, 127, 128, 255], True),
+        (32, "I", [-2147483648, -1, 0, 1, 2147483647], True),
+        (-32, "F", [-2.5, -1.0, 0.0, 1.0, 2.5], True),
+    ],
+)
+def test_gzip_bit_depths(
+    bitpix: int, mode: str, values: list[int | float], widened: bool
+) -> None:
+    with Image.open(BytesIO(fits_gzip_image(bitpix, values, widened))) as im:
+        assert im.mode == mode
+        assert [im.getpixel((x, 0)) for x in range(im.width)] == values
+
+
 def test_16bit_is_signed() -> None:
     # FITS 16-bit integers are signed
     with Image.open(BytesIO(fits_image(16, [-32768, -1, 0, 1, 32767]))) as im:
@@ -173,3 +235,17 @@ def test_bscale_keyword_in_info() -> None:
     ) as im:
         assert im.info["BZERO"] == 100
         assert im.info["BSCALE"] == 0.5
+
+
+@pytest.mark.parametrize("keyword", ["BZERO", "BSCALE"])
+def test_scaling_keywords_preserve_integer_precision(keyword: str) -> None:
+    value = 2**53 + 1
+    with Image.open(
+        BytesIO(fits_image(16, [0], [f"{keyword}   = {value:20d}"]))
+    ) as im:
+        assert im.info[keyword] == value
+
+
+def test_invalid_scaling_keyword() -> None:
+    with Image.open(BytesIO(fits_image(16, [0], ["BZERO   = 'invalid'"]))) as im:
+        assert "BZERO" not in im.info
